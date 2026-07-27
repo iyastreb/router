@@ -75,22 +75,6 @@ fn discovery_is_ready(prefill_count: usize, decode_count: usize) -> bool {
     prefill_count > 0 && decode_count > 0
 }
 
-/// Strip the DP-rank suffix from a worker's HTTP address and return the base address
-/// plus the parsed rank. Returns `(original, None)` when DP is disabled.
-fn extract_base_http_and_dp_rank(
-    http: &str,
-    intra_node_data_parallel_size: usize,
-) -> (String, Option<usize>) {
-    if intra_node_data_parallel_size > 1 {
-        let url = format!("http://{}", http);
-        let (base, rank) = dp_utils::parse_worker_url(&url);
-        let base_http = base.replace("http://", "").replace("https://", "");
-        (base_http, rank)
-    } else {
-        (http.to_string(), None)
-    }
-}
-
 /// Build a prefill reqwest::RequestBuilder with the standard headers and dp-rank header.
 fn build_prefill_request_builder(
     http_client: &reqwest::Client,
@@ -913,10 +897,8 @@ impl VllmPDRouter {
         // Generate a connector-specific transfer_id (None for NIXL)
         let transfer_id = self.generate_transfer_id();
 
-        let (prefill_base_http, mut prefill_dp_rank) =
-            extract_base_http_and_dp_rank(prefill_http, self.intra_node_data_parallel_size);
-        let (decode_base_http, decode_dp_rank) =
-            extract_base_http_and_dp_rank(decode_http, self.intra_node_data_parallel_size);
+        let (prefill_base_http, mut prefill_dp_rank) = dp_utils::parse_worker_url(prefill_http);
+        let (decode_base_http, decode_dp_rank) = dp_utils::parse_worker_url(decode_http);
 
         if self.intra_node_data_parallel_size > 1 && prefill_dp_rank.is_none() {
             let rank = self.prefill_dp_round_robin.fetch_add(1, Ordering::Relaxed)
