@@ -1690,8 +1690,11 @@ impl VllmPDRouter {
         let decode_zmq_addr = self.get_zmq_address(decode_worker.base_url(), ServiceType::Decode);
         let request_id = Self::generate_vllm_request_id(&prefill_zmq_addr, &decode_zmq_addr);
 
+        let decode_base_url = decode_worker.base_url().to_string();
         let mut prefill_request = Self::prepare_prefill_request(original_request.clone(), path);
-        prefill_request["kv_transfer_params"] = self.build_prefill_kv_transfer_params(None).ok()?;
+        prefill_request["kv_transfer_params"] = self
+            .build_prefill_kv_transfer_params(None, Some(&decode_base_url), decode_worker.dp_rank())
+            .ok()?;
 
         let mut decode_request = original_request.clone();
         decode_request["kv_transfer_params"] =
