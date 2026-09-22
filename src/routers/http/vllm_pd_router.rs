@@ -21,7 +21,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -61,7 +61,8 @@ pub struct VllmPDRouter {
     kv_connector: KvConnector,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
-    nixl_prefill_info: Arc<Mutex<HashMap<String, HashMap<usize, Value>>>>,
+    /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
+    nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -318,17 +319,17 @@ impl VllmPDRouter {
                 }
             }
             KvConnector::Nixl => {
-                let kvt = prefill_response_json?.get("kv_transfer_params")?;
-                if !Self::is_nixl_push_mode(kvt) {
-                    return Some(kvt.clone());
+                if let Some(json) = prefill_response_json {
+                    let kvt = json.get("kv_transfer_params")?;
+                    if !Self::is_nixl_push_mode(kvt) {
+                        return Some(kvt.clone());
+                    }
                 }
-                let identity = self
-                    .ensure_nixl_push_identity(
-                        prefill_url,
-                        prefill_dp_rank.map(|r| r as usize),
-                        prefill_response_json,
-                    )
-                    .await?;
+                let identity = self.ensure_nixl_push_identity(
+                    prefill_url,
+                    prefill_dp_rank.map(|r| r as usize),
+                    prefill_response_json,
+                )?;
                 Some(Self::build_nixl_push_decode_params(&identity, request_id?))
             }
         }
@@ -408,33 +409,28 @@ impl VllmPDRouter {
         })
     }
 
-    async fn get_nixl_push_identity(
-        &self,
-        prefill_url: &str,
-        dp_rank: Option<usize>,
-    ) -> Option<Value> {
-        let identity = self.get_nixl_info(prefill_url, dp_rank).await?;
+    fn get_nixl_push_identity(&self, prefill_url: &str, dp_rank: Option<usize>) -> Option<Value> {
+        let identity = self.get_nixl_info(prefill_url, dp_rank)?;
         Self::is_nixl_push_mode(&identity).then_some(identity)
     }
 
-    async fn ensure_nixl_push_identity(
+    fn ensure_nixl_push_identity(
         &self,
         prefill_url: &str,
         dp_rank: Option<usize>,
         prefill_response_json: Option<&Value>,
     ) -> Option<Value> {
-        if let Some(identity) = self.get_nixl_push_identity(prefill_url, dp_rank).await {
+        if let Some(identity) = self.get_nixl_push_identity(prefill_url, dp_rank) {
             return Some(identity);
         }
         let identity = prefill_response_json
             .and_then(|json| json.get("kv_transfer_params"))
             .and_then(Self::nixl_push_identity_from_kvt)?;
-        self.store_nixl_info(prefill_url, dp_rank, identity.clone())
-            .await;
+        self.store_nixl_info(prefill_url, dp_rank, identity.clone());
         Some(identity)
     }
 
-    async fn maybe_cache_nixl_push_identity(
+    fn maybe_cache_nixl_push_identity(
         &self,
         prefill_url: &str,
         dp_rank: Option<usize>,
@@ -444,28 +440,43 @@ impl VllmPDRouter {
             .get("kv_transfer_params")
             .and_then(Self::nixl_push_identity_from_kvt)
         {
-            self.store_nixl_info(prefill_url, dp_rank, identity).await;
+            self.store_nixl_info(prefill_url, dp_rank, identity);
         }
     }
 
-    async fn get_nixl_info(&self, prefill_url: &str, dp_rank: Option<usize>) -> Option<Value> {
-        let info = self.nixl_prefill_info.lock().await;
-        if let Some(per_rank) = info.get(prefill_url) {
-            if let Some(rank) = dp_rank {
-                return per_rank.get(&rank).cloned();
-            }
-            if let Some(identity) = per_rank.values().next() {
-                return Some(identity.clone());
-            }
+    fn get_nixl_info(&self, prefill_url: &str, dp_rank: Option<usize>) -> Option<Value> {
+        let info = self.nixl_prefill_info.read().unwrap();
+        let per_rank = info.get(prefill_url)?;
+        match dp_rank {
+            Some(rank) => per_rank.get(&rank).cloned(),
+            None => per_rank.values().next().cloned(),
         }
-        None
     }
 
-    async fn store_nixl_info(&self, prefill_url: &str, dp_rank: Option<usize>, identity: Value) {
-        let mut info = self.nixl_prefill_info.lock().await;
+    fn store_nixl_info(&self, prefill_url: &str, dp_rank: Option<usize>, identity: Value) {
+        let mut info = self.nixl_prefill_info.write().unwrap();
         info.entry(prefill_url.to_string())
             .or_default()
             .insert(dp_rank.unwrap_or(0), identity);
+    }
+
+    /// A bare URL evicts every rank; a `@rank` URL evicts only that rank.
+    fn evict_nixl_info(&self, worker_url: &str) {
+        let (base_url, dp_rank) = dp_utils::parse_worker_url(worker_url);
+        let mut info = self.nixl_prefill_info.write().unwrap();
+        match dp_rank {
+            Some(rank) => {
+                if let Some(per_rank) = info.get_mut(&base_url) {
+                    per_rank.remove(&rank);
+                    if per_rank.is_empty() {
+                        info.remove(&base_url);
+                    }
+                }
+            }
+            None => {
+                info.remove(&base_url);
+            }
+        }
     }
 
     /// Generate vLLM-specific request ID with prefill/decode addressing
@@ -927,7 +938,6 @@ impl VllmPDRouter {
             || (matches!(self.kv_connector, KvConnector::Nixl)
                 && self
                     .get_nixl_push_identity(&prefill_url_key, prefill_dp_rank)
-                    .await
                     .is_some());
 
         let needs_logprobs = request_json.get("logprobs").is_some()
@@ -1186,8 +1196,7 @@ impl VllmPDRouter {
                     &prefill_url_key,
                     prefill_dp_rank,
                     prefill_json,
-                )
-                .await;
+                );
             }
             let decode_response = match decode_result {
                 Ok(resp) => resp,
@@ -1681,9 +1690,7 @@ impl VllmPDRouter {
 
         let prefill_base_url = prefill_worker.base_url().to_string();
         let prefill_dp_rank = prefill_worker.dp_rank();
-        let identity = self
-            .get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)
-            .await?;
+        let identity = self.get_nixl_push_identity(&prefill_base_url, prefill_dp_rank)?;
 
         let prefill_zmq_addr =
             self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
@@ -1804,8 +1811,7 @@ impl VllmPDRouter {
             }
         };
         if let Some(prefill_json) = prefill_response_json.as_ref() {
-            self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json)
-                .await;
+            self.maybe_cache_nixl_push_identity(&prefill_base_url, prefill_dp_rank, prefill_json);
         }
 
         let decode_response = match decode_result {
@@ -1909,7 +1915,7 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
-                nixl_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                nixl_prefill_info: RwLock::new(HashMap::new()),
             })
         } else {
             // Direct URL mode (same as PdRouterBase)
@@ -1999,7 +2005,7 @@ impl VllmPDRouter {
                 prefill_dp_round_robin: Arc::new(AtomicUsize::new(0)),
                 kv_connector,
                 mooncake_prefill_info,
-                nixl_prefill_info: Arc::new(Mutex::new(HashMap::new())),
+                nixl_prefill_info: RwLock::new(HashMap::new()),
             })
         }
     }
@@ -2011,6 +2017,7 @@ impl VllmPDRouter {
         url: String,
         bootstrap_port: Option<u16>,
     ) -> Result<String, PDRouterError> {
+        self.evict_nixl_info(&url);
         self.pd_router.add_prefill_server(url, bootstrap_port).await
     }
 
@@ -2023,6 +2030,7 @@ impl VllmPDRouter {
     /// Remove a prefill server from the router
     /// Delegates to the underlying PdRouterBase
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
+        self.evict_nixl_info(url);
         self.pd_router.remove_prefill_server(url).await
     }
 
@@ -2698,6 +2706,7 @@ impl WorkerManagement for VllmPDRouter {
     }
 
     fn remove_worker(&self, worker_url: &str) {
+        self.evict_nixl_info(worker_url);
         self.pd_router.remove_worker(worker_url);
     }
 
